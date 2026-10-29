@@ -53,12 +53,29 @@ def parser():
         if name=='demo':
             s.add_argument('--host',default='127.0.0.1');s.add_argument('--port',type=int,default=7860)
             s.add_argument('--sam-checkpoint');s.add_argument('--output-root',default='demo_outputs')
+            s.add_argument('--sam3-python',help='Python executable in a separate SAM 3 environment')
+            s.add_argument('--sam3-checkpoint',help='Optional local SAM 3 checkpoint')
+    s=sub.add_parser('sam3-mask',help='Generate one mask per matching object with SAM 3')
+    s.add_argument('--rgb',required=True);s.add_argument('--output',required=True)
+    s.add_argument('--sam3-python',required=True);s.add_argument('--sam3-checkpoint')
+    s.add_argument('--prompt',default='water bottle');s.add_argument('--confidence',type=float,default=0.5)
     return p
 
 
 def main(argv=None):
     args=parser().parse_args(argv)
     os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR','1')
+    if args.command=='sam3-mask':
+        from pathlib import Path
+        from PIL import Image
+        import numpy as np
+        from .sam3 import generate_masks
+        if not args.prompt.strip() or not 0 <= args.confidence <= 1:
+            parser().error('Prompt must be nonempty and confidence must be between 0 and 1.')
+        rgb=np.asarray(Image.open(args.rgb).convert('RGB'))
+        paths=generate_masks(rgb,args.output,args.sam3_python,args.prompt,args.sam3_checkpoint,args.confidence)
+        print(f'Saved {len(paths)} mask(s) in {Path(args.output).resolve()}')
+        return
     if args.cache_dir:
         from pathlib import Path
         cache=Path(args.cache_dir).resolve()

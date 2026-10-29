@@ -63,6 +63,8 @@ f2g-pose demo --checkpoint weights/f2g-pose.pt --port 7860
 
 Open **http://127.0.0.1:7860**, upload RGB, depth, and a mask, then enter the camera intrinsics and depth units. The demo displays pose axes, a 3D box, and the completed shape, with JSON and PLY downloads. Optional [SAM prompting](docs/USAGE.md#interactive-demo) lets you select the object with clicks or a box.
 
+Optional [SAM 3 automatic masks](docs/USAGE.md#automatic-sam-3-masks) find all instances matching a text prompt such as `water bottle` and save a separate mask for each one. SAM 3 runs in its own environment.
+
 For a ready-to-use real input, try the [bundled ROPE teapot sample](examples/rope/README.md). It includes aligned RGB, metric depth, a target mask, camera intrinsics, and a one-object evaluation manifest.
 
 For Python applications:

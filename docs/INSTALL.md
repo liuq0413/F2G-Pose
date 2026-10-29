@@ -84,3 +84,28 @@ python scripts/download_weights.py \
 ```
 
 Pass `--sam-checkpoint weights/sam_vit_b_01ec64.pth` when starting the demo.
+
+## Optional: SAM 3 automatic instance masks
+
+SAM 3 has different requirements from this project's pinned environment: Python 3.12+, PyTorch 2.7+, and a CUDA 12.6+ compatible setup. Install the [official SAM 3 repository](https://github.com/facebookresearch/sam3#installation) in a separate environment; do not upgrade F2G-Pose's `.venv` in place. One possible setup from the F2G-Pose root is:
+
+```bash
+uv venv --python 3.12 third_party_local/.venv-sam3
+uv pip install --python third_party_local/.venv-sam3/bin/python \
+  torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+git clone https://github.com/facebookresearch/sam3.git third_party_local/SAM3
+uv pip install --python third_party_local/.venv-sam3/bin/python -e third_party_local/SAM3
+```
+
+Request access to the [official SAM 3 checkpoint](https://huggingface.co/facebook/sam3) and authenticate in that environment (`hf auth login`), or supply your local checkpoint with `--sam3-checkpoint`. This access step is controlled by the model publisher. `third_party_local/` is ignored by Git. The `--sam3-python` option on `f2g-pose demo` and `f2g-pose sam3-mask` selects this separate environment.
+
+To download the Hugging Face files into the project, run the following from the F2G-Pose root after authentication:
+
+```bash
+SAM3_PYTHON=third_party_local/.venv-sam3/bin/python
+$SAM3_PYTHON -m pip install -U huggingface_hub
+third_party_local/.venv-sam3/bin/hf auth login
+$SAM3_PYTHON scripts/download_sam3.py --output weights/sam3
+```
+
+如果系统已有 `hf` 命令，也可以把登录步骤替换成 `hf auth login`。脚本优先使用 `HF_TOKEN`，未设置时使用 Hugging Face 登录缓存。下载完成后，可用 `Sam3Model.from_pretrained("weights/sam3")` 加载本地目录。官方 SAM 3 worker 可以继续使用已认证的 Hugging Face 缓存；`--sam3-checkpoint` 只用于单独提供的本地 checkpoint 文件。

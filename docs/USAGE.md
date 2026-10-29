@@ -2,7 +2,7 @@
 
 [← README](../README.md) · [Installation](INSTALL.md) · [Evaluation results](EVALUATION.md)
 
-The CLI has five commands: `f2g-pose train`, `eval`, `predict`, `demo`, and `benchmark`. Run any command with `--help` for its options. Complete [installation](INSTALL.md) first, including RADIO and the model weights.
+The CLI has six commands: `f2g-pose train`, `eval`, `predict`, `demo`, `benchmark`, and `sam3-mask`. Run any command with `--help` for its options. Complete [installation](INSTALL.md) first, including RADIO and the model weights.
 
 ## Interactive demo
 
@@ -20,6 +20,26 @@ f2g-pose demo --checkpoint weights/f2g-pose.pt \
 ```
 
 Click foreground points or enter an `x_min y_min x_max y_max` box, choose **Preview SAM mask**, then **Confirm preview mask** before estimating pose. Each browser session has its own selection and downloads.
+
+### Automatic SAM 3 masks
+
+SAM 3 runs in a separate Python environment; see [installation](INSTALL.md#optional-sam-3-automatic-instance-masks). Start the demo with `--sam3-python` pointing to that environment:
+
+```bash
+f2g-pose demo --checkpoint weights/f2g-pose.pt --port 7860 \
+  --sam3-python third_party_local/.venv-sam3/bin/python
+```
+
+Upload RGB, enter a short English phrase such as `water bottle`, then click **Find all with SAM 3**. Select each detected bottle in the dropdown, inspect the preview, and click **Confirm preview mask** before estimating its pose. The individual binary masks can also be downloaded. Upload aligned depth, set the actual camera intrinsics and depth units as usual. After moving bottles, upload the new RGB and aligned depth and generate masks again. Detection order is left to right; verify the preview because transparent bottles can be missed or merged.
+
+Generate masks without starting the demo:
+
+```bash
+f2g-pose sam3-mask --rgb example/rgb.png --output outputs/bottle_masks \
+  --sam3-python third_party_local/.venv-sam3/bin/python --prompt 'water bottle'
+```
+
+This creates `mask_01.png`, `mask_02.png`, etc. and `masks.json` with confidence scores. If you already have an authorized SAM 3 checkpoint on disk, pass `--sam3-checkpoint /path/to/sam3.pt`; otherwise SAM 3 downloads from Hugging Face using your own authenticated access. Run `f2g-pose predict` once per mask. A zero-instance result produces only `masks.json`; adjust the prompt or confidence threshold (`--confidence`) and inspect the results. SAM 3 produces RGB masks, which are also used to select pixels from aligned depth; a separate depth mask is unnecessary.
 
 For a remote server, forward the port from your local terminal:
 

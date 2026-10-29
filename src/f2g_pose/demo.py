@@ -71,12 +71,13 @@ def visualization(rgb,K,result):
 
 
 def confirmed_mask(rgb,uploaded,state):
+    if state and state.get('digest')==image_digest(rgb):
+        if not state.get('confirmed'):
+            raise ValueError('Inspect and confirm the mask selected for this RGB image first.')
+        return state['mask']
     if uploaded:
-        mask=np.asarray(Image.open(uploaded))
-        return mask
-    if not state or state.get('digest')!=image_digest(rgb) or not state.get('confirmed'):
-        raise ValueError('Upload a binary mask, or preview and confirm a SAM mask for the current RGB image.')
-    return state['mask']
+        return np.asarray(Image.open(uploaded))
+    raise ValueError('Upload a binary mask, or preview and confirm a SAM mask for the current RGB image.')
 
 
 def build_demo(estimator,args,gpu_decorator=None):
@@ -87,8 +88,8 @@ def build_demo(estimator,args,gpu_decorator=None):
     segmenter=Segmenter(args.sam_checkpoint,estimator.device,cache_model=gpu_decorator is None) if args.sam_checkpoint else None
     output_root=Path(args.output_root).resolve();output_root.mkdir(parents=True,exist_ok=True)
     with gr.Blocks(title='F2G-Pose',delete_cache=(3600,86400),analytics_enabled=False) as demo:
-        gr.Markdown('# F2G-Pose\nUpload aligned RGB and raw depth for **one object**. Use a binary mask or select the target with SAM. Camera coordinates: X right, Y down, Z forward. Translation and dimensions are in meters.')
-        state=gr.State({});points=gr.State([])
+        gr.Markdown('# F2G-Pose\nUpload aligned RGB and raw depth for **one object**. Use a binary mask, select the target with SAM, or generate instance masks with SAM 3. Camera coordinates: X right, Y down, Z forward. Translation and dimensions are in meters.')
+        state=gr.State({});points=gr.State([]);auto_state=gr.State({})
         with gr.Row():
             rgb=gr.Image(label='RGB (PNG/JPEG); click target for SAM',type='numpy',image_mode='RGB',sources=['upload'])
             preview=gr.Image(label='Mask preview',interactive=False)
@@ -106,6 +107,11 @@ def build_demo(estimator,args,gpu_decorator=None):
             segment=gr.Button('Preview SAM mask',interactive=segmenter is not None)
             confirm=gr.Button('Confirm preview mask')
             clear=gr.Button('Clear selection')
+        with gr.Row():
+            prompt=gr.Textbox(label='SAM 3 text prompt',value='water bottle')
+            auto=gr.Button('Find all with SAM 3',interactive=bool(args.sam3_python))
+        choice=gr.Dropdown(label='SAM 3 object (left to right)',choices=[],interactive=True)
+        auto_files=gr.Files(label='Download SAM 3 instance masks')
         status=gr.Textbox(label='Status',interactive=False)
         shape=gr.Checkbox(value=True,label='Complete shape')
         predict=gr.Button('Estimate pose',variant='primary')
@@ -114,9 +120,10 @@ def build_demo(estimator,args,gpu_decorator=None):
             plot=gr.Plot(label='Camera-space shape and box')
         pose=gr.JSON(label='T_cam_obj and metric dimensions')
         downloads=gr.Files(label='Download JSON / PLY')
-        def reset():return {},[],None,'Selection cleared'
-        rgb.upload(reset,outputs=[state,points,preview,status])
-        clear.click(reset,outputs=[state,points,preview,status])
+        def reset():return {},[],None,'Selection cleared',{},gr.update(choices=[],value=None),[]
+        reset_outputs=[state,points,preview,status,auto_state,choice,auto_files]
+        rgb.upload(reset,outputs=reset_outputs)
+        clear.click(reset,outputs=reset_outputs)
         def select_point(existing,evt:gr.SelectData):
             updated=list(existing)+[list(evt.index)]
             return updated,{},f'{len(updated)} foreground point(s); preview SAM mask next.'
@@ -132,6 +139,31 @@ def build_demo(estimator,args,gpu_decorator=None):
             selected,ms=segmenter.predict(image,pts,bounds)
             return overlay(image,selected),dict(mask=selected,digest=image_digest(image),confirmed=False,sam_ms=ms),f'SAM took {ms:.1f} ms. Inspect the mask, then confirm it.'
         segment.click(gpu_decorator(segment_target) if gpu_decorator else segment_target,inputs=[rgb,points,box],outputs=[preview,state,status],concurrency_limit=1)
+        def find_all(image,phrase):
+            if image is None:raise gr.Error('Upload RGB first.')
+            if not phrase.strip():raise gr.Error('Enter a SAM 3 text prompt.')
+            from .sam3 import generate_masks
+            try:
+                paths=generate_masks(image,output_root/uuid.uuid4().hex,args.sam3_python,
+                                     phrase,args.sam3_checkpoint)
+            except (ValueError,RuntimeError,OSError) as exc:raise gr.Error(str(exc))
+            options=[(f'Object {i:02d}',str(path)) for i,path in enumerate(paths,1)]
+            first_path=str(paths[0]) if paths else None
+            first_mask=(np.asarray(Image.open(first_path))>0) if first_path else None
+            first_state=(dict(mask=first_mask,digest=image_digest(image),confirmed=False)
+                         if first_mask is not None else {})
+            return ({'digest':image_digest(image),'paths':[str(path) for path in paths]},
+                    gr.update(choices=options,value=first_path),[str(path) for path in paths],
+                    first_state,overlay(image,first_mask) if first_mask is not None else None,
+                    f'SAM 3 found {len(paths)} object(s). First mask is previewed; select another if needed.')
+        auto.click(find_all,inputs=[rgb,prompt],outputs=[auto_state,choice,auto_files,state,preview,status],concurrency_limit=1)
+        def select_auto(image,path,available):
+            if image is None or not available or available.get('digest')!=image_digest(image) or path not in available['paths']:
+                raise gr.Error('Generate SAM 3 masks for this RGB image first.')
+            selected=np.asarray(Image.open(path))>0
+            if selected.shape!=image.shape[:2]:raise gr.Error('SAM 3 mask dimensions differ from RGB.')
+            return overlay(image,selected),dict(mask=selected,digest=image_digest(image),confirmed=False),'Inspect the selected mask, then confirm it.'
+        choice.input(select_auto,inputs=[rgb,choice,auto_state],outputs=[preview,state,status])
         def confirm_target(image,current):
             if image is None or not current or current.get('digest')!=image_digest(image):raise gr.Error('Preview a SAM mask for this RGB image first.')
             current=dict(current,confirmed=True);return current,'Mask confirmed; ready for pose estimation.'
