@@ -55,6 +55,7 @@ def parser():
             s.add_argument('--sam-checkpoint');s.add_argument('--output-root',default='demo_outputs')
             s.add_argument('--sam3-python',help='Python executable in a separate SAM 3 environment')
             s.add_argument('--sam3-checkpoint',help='Optional local SAM 3 checkpoint')
+            s.add_argument('--head-camera-url',help='Head camera HTTP /frame URL for one-frame capture')
     s=sub.add_parser('sam3-mask',help='Generate one mask per matching object with SAM 3')
     s.add_argument('--rgb',required=True);s.add_argument('--output',required=True)
     s.add_argument('--sam3-python',required=True);s.add_argument('--sam3-checkpoint')

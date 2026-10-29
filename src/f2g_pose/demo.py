@@ -90,6 +90,7 @@ def build_demo(estimator,args,gpu_decorator=None):
     with gr.Blocks(title='F2G-Pose',delete_cache=(3600,86400),analytics_enabled=False) as demo:
         gr.Markdown('# F2G-Pose\nUpload aligned RGB and raw depth for **one object**. Use a binary mask, select the target with SAM, or generate instance masks with SAM 3. Camera coordinates: X right, Y down, Z forward. Translation and dimensions are in meters.')
         state=gr.State({});points=gr.State([]);auto_state=gr.State({})
+        capture=gr.Button('Capture head RGB-D frame',interactive=bool(getattr(args,'head_camera_url',None)))
         with gr.Row():
             rgb=gr.Image(label='RGB (PNG/JPEG); click target for SAM',type='numpy',image_mode='RGB',sources=['upload'])
             preview=gr.Image(label='Mask preview',interactive=False)
@@ -124,6 +125,23 @@ def build_demo(estimator,args,gpu_decorator=None):
         reset_outputs=[state,points,preview,status,auto_state,choice,auto_files]
         rgb.upload(reset,outputs=reset_outputs)
         clear.click(reset,outputs=reset_outputs)
+        def capture_head():
+            from .head_camera import fetch_frame
+            try:
+                image,z,K,delta=fetch_frame(args.head_camera_url)
+            except (ValueError,KeyError,TypeError,OSError) as exc:
+                raise gr.Error(f'Head camera capture failed: {exc}')
+            target=output_root/uuid.uuid4().hex
+            target.mkdir()
+            path=target/'depth.png'
+            Image.fromarray(z).save(path)
+            return (image,str(path),'Millimeters',float(K[0,0]),float(K[1,1]),
+                    float(K[0,2]),float(K[1,2]),'',None,{},[],None,{},
+                    gr.update(choices=[],value=None),[],
+                    f'Captured aligned head frame (RGB/depth Δ {delta*1000:.1f} ms). Generate and confirm a mask.')
+        capture.click(capture_head,outputs=[rgb,depth,unit,fx,fy,cx,cy,Ktext,mask,
+                                           state,points,preview,auto_state,choice,auto_files,status],
+                      concurrency_limit=1)
         def select_point(existing,evt:gr.SelectData):
             updated=list(existing)+[list(evt.index)]
             return updated,{},f'{len(updated)} foreground point(s); preview SAM mask next.'

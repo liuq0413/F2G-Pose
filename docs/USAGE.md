@@ -49,6 +49,19 @@ ssh -L 7860:127.0.0.1:7860 user@server
 
 ## Input formats
 
+### Head camera HTTP capture
+
+For the local `head_rgb_depth_http` bridge, start the demo with
+`--head-camera-url http://6.6.7.100:8765/frame`. Click **Capture head RGB-D frame**
+to fill the RGB, millimeter depth and RGB camera intrinsics, then generate SAM 3
+masks, select the target, confirm its mask and click **Estimate pose**.
+The bridge must publish depth aligned to color and include the RGB `camera_info`;
+the demo rejects unaligned frames, inconsistent dimensions and RGB/depth timestamps
+more than 100 ms apart. See the bridge's README for the aligned depth topic setup.
+The output `T_cam_obj` is in the head camera optical frame. To express it in
+`base_link`, use the validated head hand-eye calibration plus head joint angles
+at the image timestamp; the fixed hand-eye transform alone is insufficient.
+
 | Input | Format |
 | --- | --- |
 | RGB | PNG/JPEG file, or an `H×W×3` uint8 NumPy array in RGB order |
