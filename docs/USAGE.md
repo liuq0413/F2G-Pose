@@ -62,6 +62,65 @@ The output `T_cam_obj` is in the head camera optical frame. To express it in
 `base_link`, use the validated head hand-eye calibration plus head joint angles
 at the image timestamp; the fixed hand-eye transform alone is insufficient.
 
+### Request-driven ROS pose publisher for `head_object_grasp.py`
+
+The F2G-Pose ROS bridge subscribes to `/f2g_pose/request` (`std_msgs/Empty`).
+On one request it detects the target with SAM 3, then estimates poses on newly
+captured RGB-D frames and publishes `geometry_msgs/PoseStamped` to `/object_pose`.
+It publishes only camera-space observations; the grasp program resolves the
+calibrated head TF into `base_link` and performs its existing checks. The bridge
+does not send IK or gripper commands. Keep the head camera and object still
+through the capture; if the target appearance or depth changes substantially,
+the bridge stops rather than reusing the old mask. Multiple detections require
+an explicit `--instance-index` (left to right, starting from 1).
+
+On the local machine, source the robot's ROS environment and start the head
+calibration TF broadcaster with `calibration_data/head_extrinsic.yaml`. Ensure
+`/tj/joint_states` is live and `base_link -> luna_head_calibrated_optical` is
+available at the image time. In another terminal, start the read-only bridge:
+
+```bash
+source /home/liuqian/copy/Apex_Deploy/apex_ros_env.sh
+source /home/liuqian/WBC/Apex_Deploy/install/setup.bash
+export PATH=/usr/bin:$PATH PYTHONNOUSERSITE=1
+ros2 run luna_handeye_calibration camera_tf_broadcaster --ros-args \
+  -r __node:=luna_head_camera_tf \
+  -p calibration_file:=/home/liuqian/WBC/Apex_Deploy/calibration_data/head_extrinsic.yaml \
+  -p model_path:=/home/liuqian/copy/Apex_Deploy/robot_node/marvin_description/mjcf/Gento_Luna/Gento_Luna.xml \
+  -p joint_topic:=/tj/joint_states
+```
+
+In a second terminal:
+
+```bash
+cd /home/liuqian/copy/F2G-Pose
+source /home/liuqian/copy/Apex_Deploy/apex_ros_env.sh
+source /home/liuqian/WBC/Apex_Deploy/install/setup.bash
+/usr/bin/python3 scripts/publish_head_pose.py --prompt 'water bottle'
+```
+
+Start the grasp program in preview mode first, using the same ROS environment:
+
+```bash
+cd /home/liuqian/copy/test
+/usr/bin/python3 head_object_grasp.py --side left \
+  --object-pose-topic /object_pose --pose-request-topic /f2g_pose/request \
+  --capture-timeout 45 \
+  --model-xml /home/liuqian/copy/Apex_Deploy/robot_node/marvin_description/mjcf/Gento_Luna/Gento_Luna.xml
+```
+
+The bridge estimates the image time from the HTTP server's `rgb_age_s` at local
+receipt, matching the calibration's `ros_host_arrival` time convention. Check
+host clock synchronization and TF latency on the actual robot. The image mask
+and object origin are not a grasp pose: inspect the previewed `base_link` goal,
+choose a measured grasp offset, and validate reachability before enabling
+`--execute`. The calibration's recorded MJCF checksum matches the
+`/home/liuqian/copy/Apex_Deploy` model; the WBC model currently has a different
+checksum. Confirm which model controls the physical robot and revalidate the
+calibration before real motion. The grasp program repeats unanswered requests;
+the publisher ignores duplicates while inference is active and accepts another
+request after the current inference finishes.
+
 | Input | Format |
 | --- | --- |
 | RGB | PNG/JPEG file, or an `H×W×3` uint8 NumPy array in RGB order |

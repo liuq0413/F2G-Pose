@@ -1,6 +1,7 @@
 """Read one aligned RGB-D frame from the head camera HTTP bridge."""
 import json
 import struct
+import time
 from urllib.request import ProxyHandler, build_opener
 
 import cv2
@@ -10,7 +11,7 @@ import numpy as np
 MAX_PACKET_BYTES = 16 * 1024 * 1024
 
 
-def decode_frame(packet, max_delta_s=0.1):
+def decode_frame(packet, max_delta_s=0.1, with_metadata=False):
     if not 4 <= len(packet) <= MAX_PACKET_BYTES:
         raise ValueError('Invalid head camera packet size.')
     header_size = struct.unpack('!I', packet[:4])[0]
@@ -41,12 +42,16 @@ def decode_frame(packet, max_delta_s=0.1):
     K = intrinsics_matrix(np.asarray(info['K'], dtype=np.float32).reshape(3, 3))
     if depth.shape != rgb.shape[:2]:
         raise ValueError(f'RGB {rgb.shape[:2]} and depth {depth.shape} differ; align depth to color first.')
-    return rgb, depth, K, delta
+    return (rgb, depth, K, delta, header) if with_metadata else (rgb, depth, K, delta)
 
 
-def fetch_frame(url, timeout=3):
+def fetch_frame(url, timeout=3, with_metadata=False):
     # 机器人局域网连接不应经过用户终端的 HTTP/SOCKS 代理。
     opener = build_opener(ProxyHandler({}))
     with opener.open(url, timeout=timeout) as response:
         packet = response.read(MAX_PACKET_BYTES + 1)
-    return decode_frame(packet)
+    received_at = time.time()
+    result = decode_frame(packet, with_metadata=with_metadata)
+    if with_metadata:
+        result[-1]['local_receive_stamp'] = received_at
+    return result

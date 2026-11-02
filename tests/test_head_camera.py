@@ -16,8 +16,10 @@ def packet(*, aligned=True, delta=0.01, depth_width=12, camera_info=True):
     assert ok_rgb and ok_depth
     metadata = dict(rgb_stamp=1., depth_stamp=1. + delta, depth_unit='mm',
                     depth_aligned_to_color=aligned,
+                    rgb_age_s=.02,
                     camera_info={'K': [100, 0, 6, 0, 100, 4, 0, 0, 1],
-                                 'width': 12, 'height': 8} if camera_info else None,
+                                 'width': 12, 'height': 8,
+                                 'frame_id': 'camera_color_optical_frame'} if camera_info else None,
                     rgb_bytes=len(jpeg), depth_bytes=len(png))
     header = json.dumps(metadata).encode()
     return struct.pack('!I', len(header)) + header + jpeg.tobytes() + png.tobytes()
@@ -30,6 +32,9 @@ def test_aligned_frame_provides_color_depth_and_intrinsics():
     assert depth.dtype == np.uint16 and np.all(depth == 1200)
     assert K[0, 0] == 100 and K[1, 2] == 4
     assert delta == pytest.approx(.01)
+    _, _, _, _, header = decode_frame(packet(), with_metadata=True)
+    assert header['rgb_age_s'] == .02
+    assert header['camera_info']['frame_id'] == 'camera_color_optical_frame'
 
 
 @pytest.mark.parametrize('kwargs', [dict(aligned=False), dict(delta=.5),
