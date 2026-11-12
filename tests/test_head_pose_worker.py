@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,3 +73,73 @@ def test_run_publishes_fresh_camera_pose_without_motion_commands(monkeypatch, tm
     assert record['pose']['stamp'] == 2.
     assert record['pose']['position_m'] == [.2, .1, .8]
     assert record['pose']['quaternion_xyzw'] == [0., 0., 0., 1.]
+
+
+def test_repeated_requests_reuse_mask_and_resegment_after_motion(monkeypatch, tmp_path, capsys):
+    rgb = np.full((8, 12, 3), 100, np.uint8)
+    moved = np.full_like(rgb, 200)
+    depth = np.full((8, 12), 1000, np.uint16)
+    samples = iter([
+        (rgb, depth, np.eye(3), 1., 10.), (rgb, depth, np.eye(3), 2., 11.),
+        (rgb, depth, np.eye(3), 3., 12.), (rgb, depth, np.eye(3), 4., 13.),
+        (moved, depth, np.eye(3), 5., 14.), (moved, depth, np.eye(3), 6., 15.),
+    ])
+    monkeypatch.setattr(worker, 'capture_retry', lambda *_: next(samples))
+    monkeypatch.setattr(worker.time, 'time', lambda: 6.1)
+    calls = []
+
+    class FakeSam3:
+        def generate(self, image, output, prompt):
+            calls.append(image.copy())
+            output.mkdir()
+            mask = output / 'mask_01.png'
+            Image.fromarray(np.ones((8, 12), np.uint8) * 255).save(mask)
+            return [mask]
+
+    estimate = SimpleNamespace(predict=lambda *a, **k: {
+        'translation_m': np.array([.2, .1, .8]), 'rotation': np.eye(3)})
+    args = SimpleNamespace(camera_url='http://camera/frame', camera_frame='camera_color_optical_frame',
+                           max_frame_age=.15, sam3_python='python', prompt='bottle',
+                           sam3_checkpoint='checkpoint', confidence=.5, instance_index=None,
+                           checkpoint='f2g', radio_repository='radio', radio_checkpoint='radio.ckpt',
+                           device='cuda:0', duration=10., max_frames=1, max_pose_age=10.,
+                           interval=.001, frame_id='luna_head_calibrated_optical')
+    cache = {}
+    for _ in range(3):
+        assert worker.run(args, estimate, FakeSam3(), cache) == 0
+    assert len(calls) == 2
+    assert np.array_equal(calls[0], rgb) and np.array_equal(calls[1], moved)
+    assert len(capsys.readouterr().out.splitlines()) == 3
+
+
+def test_service_keeps_models_loaded_for_multiple_requests(monkeypatch, capsys):
+    import io
+    monkeypatch.setattr(worker.sys, 'stdin', io.StringIO('{"request":true}\n{"request":true}\n'))
+    created = []
+    requests = []
+
+    def make_model(*args, **kwargs):
+        model = object()
+        created.append(model)
+        return model
+
+    class FakeSam3:
+        def __init__(self, *args):
+            created.append(self)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, 'PoseEstimator', make_model)
+    monkeypatch.setattr(worker, 'Sam3Client', FakeSam3)
+    monkeypatch.setattr(worker, 'run', lambda args, model, client, cache:
+                        requests.append((model, client, cache)))
+    args = SimpleNamespace(checkpoint='f2g', radio_repository='radio',
+                           radio_checkpoint='radio.ckpt', device='cuda:0',
+                           sam3_python='python', sam3_checkpoint='sam3.pt', confidence=.5)
+    worker.serve(args)
+    messages = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert messages == [{'ready': True}, {'done': True}, {'done': True}]
+    assert len(created) == 2 and len(requests) == 2
+    assert requests[0][0] is requests[1][0] and requests[0][1] is requests[1][1]
+    assert requests[0][2] is requests[1][2]

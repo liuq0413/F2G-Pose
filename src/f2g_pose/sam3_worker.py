@@ -42,36 +42,61 @@ def save_masks(output, masks, scores, shape, prompt):
     return records
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description='Generate one binary mask per SAM 3 instance.')
-    parser.add_argument('--rgb', required=True)
-    parser.add_argument('--output', required=True)
-    parser.add_argument('--prompt', default='water bottle')
-    parser.add_argument('--confidence', type=float, default=0.5)
-    parser.add_argument('--checkpoint', help='Local SAM 3 checkpoint; otherwise use authenticated Hugging Face cache')
-    args = parser.parse_args(argv)
-    if not args.prompt.strip() or not 0 <= args.confidence <= 1:
-        parser.error('Prompt must be nonempty and confidence must be between 0 and 1.')
-
+def load_processor(checkpoint, confidence):
     import torch
     from sam3.model_builder import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
-    image = Image.open(args.rgb).convert('RGB')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = build_sam3_image_model(device=device, checkpoint_path=args.checkpoint,
-                                   load_from_HF=args.checkpoint is None)
-    processor = Sam3Processor(model, device=device, confidence_threshold=args.confidence)
-    # SAM 3 的 ViT 特征路径在 CUDA 上使用 BF16；autocast 同时处理
-    # 浮点权重和 BF16 激活，避免 Linear 出现 dtype mismatch。
+    model = build_sam3_image_model(device=device, checkpoint_path=checkpoint,
+                                   load_from_HF=checkpoint is None)
+    return Sam3Processor(model, device=device, confidence_threshold=confidence), device
+
+
+def detect(processor, device, rgb_path, output, prompt):
+    import torch
+
+    image = Image.open(rgb_path).convert('RGB')
     amp = (torch.autocast(device_type='cuda', dtype=torch.bfloat16)
            if device == 'cuda' else nullcontext())
     with torch.inference_mode(), amp:
         state = processor.set_image(image)
-        result = processor.set_text_prompt(state=state, prompt=args.prompt)
-    records = save_masks(args.output, result['masks'].cpu().numpy(),
-                         result['scores'].float().cpu().numpy(),
-                         (image.height, image.width), args.prompt)
+        result = processor.set_text_prompt(state=state, prompt=prompt)
+    return save_masks(output, result['masks'].cpu().numpy(),
+                      result['scores'].float().cpu().numpy(),
+                      (image.height, image.width), prompt)
+
+
+def serve(processor, device):
+    print(json.dumps({'ready': True}), flush=True)
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            records = detect(processor, device, request['rgb'], request['output'],
+                             request['prompt'])
+            print(json.dumps({'files': [item['file'] for item in records]}), flush=True)
+        except (KeyError, ValueError, OSError, RuntimeError) as exc:
+            print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Generate one binary mask per SAM 3 instance.')
+    parser.add_argument('--rgb')
+    parser.add_argument('--output')
+    parser.add_argument('--prompt', default='water bottle')
+    parser.add_argument('--confidence', type=float, default=0.5)
+    parser.add_argument('--checkpoint', help='Local SAM 3 checkpoint; otherwise use authenticated Hugging Face cache')
+    parser.add_argument('--serve', action='store_true', help='Keep the model loaded and accept JSON requests on stdin')
+    args = parser.parse_args(argv)
+    if not args.prompt.strip() or not 0 <= args.confidence <= 1:
+        parser.error('Prompt must be nonempty and confidence must be between 0 and 1.')
+    if not args.serve and (not args.rgb or not args.output):
+        parser.error('--rgb and --output are required without --serve.')
+    processor, device = load_processor(args.checkpoint, args.confidence)
+    if args.serve:
+        serve(processor, device)
+        return
+    records = detect(processor, device, args.rgb, args.output, args.prompt)
     print(f'Saved {len(records)} mask(s) to {args.output}')
 
 

@@ -2,7 +2,12 @@
 import argparse
 import json
 from pathlib import Path
+from collections import deque
+from queue import Empty, Queue
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -12,6 +17,85 @@ from scipy.spatial.transform import Rotation
 from .estimator import PoseEstimator
 from .head_camera import fetch_frame
 from .sam3 import generate_masks
+from .sam3 import WORKER as SAM3_WORKER
+
+
+class Sam3Client:
+    """通过独立 Python 进程复用已加载的 SAM 3 模型。"""
+
+    def __init__(self, python, checkpoint, confidence):
+        command = [str(python), '-u', str(SAM3_WORKER), '--serve',
+                   '--confidence', str(confidence)]
+        if checkpoint:
+            command += ['--checkpoint', str(checkpoint)]
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, bufsize=1)
+        self.lines = Queue()
+        self.errors = deque(maxlen=30)
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        try:
+            if not self._response().get('ready'):
+                raise RuntimeError('SAM 3 服务未完成初始化。')
+        except Exception:
+            self.close()
+            raise
+
+    def _read_stdout(self):
+        for line in self.process.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def _read_stderr(self):
+        for line in self.process.stderr:
+            self.errors.append(line)
+
+    def _response(self, timeout=600.):
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('SAM 3 响应超时。')
+            try:
+                line = self.lines.get(timeout=remaining)
+            except Empty as exc:
+                raise RuntimeError('SAM 3 响应超时。') from exc
+            if line is None:
+                raise RuntimeError(f'SAM 3 服务意外退出：{"".join(self.errors)[-1500:]}')
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if 'error' in payload:
+                raise RuntimeError(f'SAM 3 推理失败：{payload["error"]}')
+            return payload
+
+    def generate(self, rgb, output, prompt):
+        output = Path(output)
+        with tempfile.TemporaryDirectory() as directory:
+            rgb_path = Path(directory) / 'rgb.png'
+            Image.fromarray(rgb).save(rgb_path)
+            request = {'rgb': str(rgb_path), 'output': str(output), 'prompt': prompt}
+            self.process.stdin.write(json.dumps(request) + '\n')
+            self.process.stdin.flush()
+            response = self._response()
+        return [output / name for name in response['files']]
+
+    def close(self):
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+        self.process.stdout.close()
+        self.process.stderr.close()
 
 
 def select_mask(paths, index):
@@ -59,14 +143,28 @@ def verify_target(reference, current, mask, reference_depth, depth):
         raise ValueError('目标深度发生变化；需要重新生成掩码。')
 
 
-def run(args, estimator=None):
+def run(args, estimator=None, sam3_client=None, cache=None):
     reference, reference_depth, _, _, _ = capture_retry(args)
+    mask = None
+    if cache is not None and cache.get('mask') is not None:
+        try:
+            verify_target(cache['rgb'], reference, cache['mask'],
+                          cache['depth'], reference_depth)
+            mask = cache['mask']
+        except ValueError:
+            cache.clear()
     with tempfile.TemporaryDirectory() as directory:
-        masks = generate_masks(reference, Path(directory) / 'masks', args.sam3_python,
-                               args.prompt, args.sam3_checkpoint, args.confidence)
-        mask = select_mask(masks, args.instance_index)
+        if mask is None:
+            output = Path(directory) / 'masks'
+            masks = (sam3_client.generate(reference, output, args.prompt)
+                     if sam3_client is not None else
+                     generate_masks(reference, output, args.sam3_python,
+                                    args.prompt, args.sam3_checkpoint, args.confidence))
+            mask = select_mask(masks, args.instance_index)
         if mask.shape != reference.shape[:2]:
             raise ValueError('SAM 3 掩码与 RGB 尺寸不一致。')
+        if cache is not None:
+            cache.update(rgb=reference, depth=reference_depth, mask=mask)
         if estimator is None:
             estimator = PoseEstimator(args.checkpoint, radio_repository=args.radio_repository,
                                       radio_checkpoint=args.radio_checkpoint, device=args.device)
@@ -93,10 +191,32 @@ def run(args, estimator=None):
                 published += 1
             except ValueError as exc:
                 # 场景变化后绝不沿用旧掩码；上游抓取程序将等待新观测并超时。
+                if cache is not None:
+                    cache.clear()
                 print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
                 return 1
             time.sleep(args.interval)
     return 0
+
+
+def serve(args):
+    estimator = PoseEstimator(args.checkpoint, radio_repository=args.radio_repository,
+                              radio_checkpoint=args.radio_checkpoint, device=args.device)
+    client = Sam3Client(args.sam3_python, args.sam3_checkpoint, args.confidence)
+    cache = {}
+    print(json.dumps({'ready': True}), flush=True)
+    try:
+        for line in sys.stdin:
+            try:
+                if json.loads(line).get('request'):
+                    run(args, estimator, client, cache)
+            except (ValueError, RuntimeError, OSError, KeyError) as exc:
+                cache.clear()
+                print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
+            finally:
+                print(json.dumps({'done': True}), flush=True)
+    finally:
+        client.close()
 
 
 def main(argv=None):
@@ -118,6 +238,7 @@ def main(argv=None):
     parser.add_argument('--max-frames', type=int, default=60)
     parser.add_argument('--duration', type=float, default=20.)
     parser.add_argument('--interval', type=float, default=.15)
+    parser.add_argument('--serve', action='store_true', help='Keep F2G-Pose and SAM 3 loaded between requests')
     args = parser.parse_args(argv)
     if (not args.prompt.strip() or not 0 <= args.confidence <= 1 or
             args.instance_index is not None and args.instance_index < 1 or
@@ -126,6 +247,8 @@ def main(argv=None):
                                           args.duration, args.interval))):
         parser.error('目标、置信度、序号或采集时限无效。')
     try:
+        if args.serve:
+            return serve(args)
         return run(args)
     except (ValueError, RuntimeError, OSError) as exc:
         print(json.dumps({'error': str(exc)}, ensure_ascii=False), flush=True)
