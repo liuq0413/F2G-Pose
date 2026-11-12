@@ -18,6 +18,7 @@ F2G-Pose lifts visual foundation features onto observed 3D points. Inputs are an
 
 - 🛠️ [Installation](docs/INSTALL.md)
 - ▶️ [Demo & inference](docs/USAGE.md#interactive-demo)
+- 🤖 [Head-camera RGB-D pose and grasp](#head-camera-rgb-d-pose-and-grasp)
 - 🧪 [Training](docs/USAGE.md#training)
 - 📊 [Evaluation](docs/EVALUATION.md)
 - 🚀 [Deployment](docs/DEPLOYMENT.md)
@@ -64,6 +65,157 @@ f2g-pose demo --checkpoint weights/f2g-pose.pt --port 7860
 Open **http://127.0.0.1:7860**, upload RGB, depth, and a mask, then enter the camera intrinsics and depth units. The demo displays pose axes, a 3D box, and the completed shape, with JSON and PLY downloads. Optional [SAM prompting](docs/USAGE.md#interactive-demo) lets you select the object with clicks or a box.
 
 Optional [SAM 3 automatic masks](docs/USAGE.md#automatic-sam-3-masks) find all instances matching a text prompt such as `water bottle` and save a separate mask for each one. SAM 3 runs in its own environment.
+
+## 头部相机 RGB-D 位姿与抓取
+
+完整流程由以下程序组成：机器人端 RGB-D HTTP 服务、头部相机手眼 TF 发布器、
+F2G-Pose Web 界面和 ROS 位姿发布器。位姿发布器在头部相机坐标系中估计物体
+位姿，并发布到 `/object_pose`；抓取程序再通过相机 TF 转换到 `base_link`。
+F2G-Pose 和位姿发布器本身不会发送机器人运动指令。
+
+下面的命令需要在不同终端中运行。实际部署路径不同时，请替换对应路径。
+
+### 1. 机器人端：RGB-D 图像服务
+
+在机器人电脑上启动对齐到彩色图像的 RealSense 深度流：
+
+```bash
+source /opt/kernelmind/apex/install/setup.bash
+export ROS_DOMAIN_ID=20
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_LOCALHOST_ONLY=0
+export CYCLONEDDS_URI=file:///etc/apex/cyclonedds.xml
+
+ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
+```
+
+在机器人电脑的另一个终端启动 HTTP 图像服务：
+
+```bash
+source /opt/kernelmind/apex/install/setup.bash
+export ROS_DOMAIN_ID=20
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_LOCALHOST_ONLY=0
+export CYCLONEDDS_URI=file:///etc/apex/cyclonedds.xml
+
+cd /home/nvidia/head_rgb_depth_http
+/usr/bin/python3 robot_server.py --host 6.6.7.100 --port 8765 \
+  --depth-topic /camera/camera/aligned_depth_to_color/image_raw
+```
+
+服务提供类似 `http://6.6.7.100:8765/frame` 的接口，必须同时返回 RGB、与彩色
+图对齐的深度图以及 RGB 相机内参。启动推理前可检查接口：
+
+```bash
+curl -sS http://6.6.7.100:8765/frame -o /tmp/head_frame.json
+```
+
+### 2. 机器人端：头部相机手眼 TF
+
+在机器人上启动经过标定的 TF 发布器。模型文件和标定文件必须属于同一套机器人：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /opt/kernelmind/apex/install/setup.bash
+source /home/nvidia/luna_handeye_ws/install/setup.bash
+export ROS_DOMAIN_ID=0
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file:///etc/apex/cyclonedds.xml
+
+ros2 run luna_handeye_calibration camera_tf_broadcaster --ros-args \
+  -r __node:=luna_head_camera_tf \
+  -p calibration_file:=/home/nvidia/luna_handeye_ws/calibration_data/head_extrinsic.yaml \
+  -p model_path:=/opt/kernelmind/apex/install/marvin_description/share/marvin_description/mjcf/Gento_Luna/Gento_Luna.xml \
+  -p joint_topic:=/tj/joint_states
+```
+
+检查 TF 是否存在：
+
+```bash
+ros2 run tf2_ros tf2_echo base_link luna_head_calibrated_optical
+```
+
+### 3. 主机端：F2G-Pose Web 界面
+
+在主机上启动 Web 界面，并指定远程 RGB-D 接口和独立的 SAM 3 Python 环境：
+
+```bash
+cd /home/liuqian/copy/F2G-Pose
+env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+  -u http_proxy -u https_proxy \
+  .venv/bin/f2g-pose demo \
+  --checkpoint weights/f2g-pose.pt \
+  --radio-repository "$PWD/third_party_local/RADIO" \
+  --radio-checkpoint "$PWD/weights/radio-v2.5-l_half.pth.tar" \
+  --sam3-python "$PWD/third_party_local/.venv-sam3/bin/python" \
+  --sam3-checkpoint "$PWD/weights/sam3/sam3.pt" \
+  --head-camera-url http://6.6.7.100:8765/frame \
+  --port 7861
+```
+
+打开 [http://127.0.0.1:7861](http://127.0.0.1:7861)，点击 **Capture head RGB-D
+frame**，输入 `water bottle` 等提示词，生成 SAM 3 掩码，选择并确认目标掩码，
+最后估计位姿。这个界面用于检查 RGB-D 对齐、相机内参、深度单位和掩码质量，
+不会控制机器人。
+
+### 4. 主机端：连续发布 ROS 位姿
+
+默认模式会持续启动推理窗口。当 RGB-D 图像仍与缓存掩码匹配时复用掩码，并发布
+稳定的相机坐标系物体位姿：
+
+```bash
+cd /home/liuqian/copy/F2G-Pose
+source /home/liuqian/copy/Apex_Deploy/apex_ros_env.sh
+source /home/liuqian/WBC/Apex_Deploy/install/setup.bash
+export PATH=/usr/bin:$PATH
+export PYTHONNOUSERSITE=1
+
+/usr/bin/python3 scripts/publish_head_pose.py \
+  --prompt 'water bottle' \
+  --instance-index 1 \
+  --max-frames 10
+```
+
+程序在头部相机光学坐标系下向 `/object_pose` 发布 `geometry_msgs/PoseStamped`。
+当估计位置变化达到 20 mm 或以上时，会在 `/object_pose_changed` 发布一次
+`std_msgs/Bool(data=True)`。可以这样查看：
+
+```bash
+ros2 topic echo /object_pose
+ros2 topic echo /object_pose_changed
+```
+
+使用 `--instance-index 2`、`3` 等参数可以选择其他 SAM 3 检测结果。若要恢复旧的
+按请求推理模式，增加 `--request-driven`；此时每收到一条 `/f2g_pose/request`
+消息才启动一轮推理。第一帧有效位姿只建立位置变化基准，不会触发变化通知。
+
+### 5. 可选：抓取程序
+
+先以预览模式启动抓取程序。它监听 `/object_pose`，使用
+`base_link -> luna_head_calibrated_optical`，没有 `--execute` 时不会移动机器人：
+
+```bash
+cd /home/liuqian/copy/test/move_agent/robot_server
+source /home/liuqian/copy/Apex_Deploy/apex_ros_env.sh
+export PYTHONNOUSERSITE=1
+
+/usr/bin/python3 -B -m agent_tools.scheduler \
+  agent_tools/head_object_grasp_task.json
+```
+
+检查生成的命令和目标位姿后，再显式加入 `--execute` 执行：
+
+```bash
+/usr/bin/python3 -B -m agent_tools.scheduler \
+  agent_tools/head_object_grasp_task.json --execute
+```
+
+任务通常使用 `side: left` 和 `grasp_offset_mm: [0, 0, -40]`，测试时可以使用
+`position-only` 或 `reach-only`。执行前确认 TF、控制源、工作空间和急停均正常。
+完整任务及 FastAPI 说明见机器人端
+`/home/liuqian/copy/test/move_agent/robot_server/README.md`，位姿桥接说明见
+[`docs/USAGE.md`](docs/USAGE.md)。
 
 For a ready-to-use real input, try the [bundled ROPE teapot sample](examples/rope/README.md). It includes aligned RGB, metric depth, a target mask, camera intrinsics, and a one-object evaluation manifest.
 
