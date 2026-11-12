@@ -62,11 +62,29 @@ The output `T_cam_obj` is in the head camera optical frame. To express it in
 `base_link`, use the validated head hand-eye calibration plus head joint angles
 at the image timestamp; the fixed hand-eye transform alone is insufficient.
 
-### Request-driven ROS pose publisher for `head_object_grasp.py`
+### ROS pose publisher for `head_object_grasp.py`
 
-The F2G-Pose ROS bridge subscribes to `/f2g_pose/request` (`std_msgs/Empty`).
-On one request it detects the target with SAM 3, then estimates poses on newly
-captured RGB-D frames and publishes `geometry_msgs/PoseStamped` to `/object_pose`.
+The F2G-Pose ROS bridge loads F2G-Pose/RADIO and the separate SAM 3 service once
+at startup, then continuously captures RGB-D, estimates poses, and publishes
+`geometry_msgs/PoseStamped` to `/object_pose`. If the target RGB and depth still
+match the cached mask, it reuses that mask; otherwise SAM 3 segments the new
+frame. Wait for `F2G-Pose 和 SAM 3 已加载` before starting a grasp. The default
+mode does not wait for `/f2g_pose/request`.
+
+In addition to `/object_pose`, it publishes a one-shot `std_msgs/Bool(data=True)`
+event on `/object_pose_changed` when the estimated object position moves at least
+20 mm from the last notified position. The threshold and topic can be changed
+with `--position-change-threshold-mm` and `--change-topic`. The first valid pose
+only establishes the reference and does not emit a change event. Other ROS nodes
+can subscribe to this event to refresh a grasp target or stop an active action:
+
+```bash
+ros2 topic echo /object_pose_changed
+```
+
+For compatibility with the old request-driven behavior, add `--request-driven`.
+In that mode the bridge subscribes to `/f2g_pose/request` (`std_msgs/Empty`) and
+runs one inference window for each request.
 It publishes only camera-space observations; the grasp program resolves the
 calibrated head TF into `base_link` and performs its existing checks. The bridge
 does not send IK or gripper commands. Keep the head camera and object still
@@ -96,7 +114,16 @@ In a second terminal:
 cd /home/liuqian/copy/F2G-Pose
 source /home/liuqian/copy/Apex_Deploy/apex_ros_env.sh
 source /home/liuqian/WBC/Apex_Deploy/install/setup.bash
-/usr/bin/python3 scripts/publish_head_pose.py --prompt 'water bottle'
+/usr/bin/python3 scripts/publish_head_pose.py --prompt 'water bottle' \
+  --instance-index 1 --max-frames 10
+```
+
+The command above continuously publishes poses. To use the old request-driven
+mode instead:
+
+```bash
+/usr/bin/python3 scripts/publish_head_pose.py --prompt 'water bottle' \
+  --instance-index 1 --max-frames 10 --request-driven
 ```
 
 Start the grasp program in preview mode first, using the same ROS environment:
@@ -117,9 +144,12 @@ choose a measured grasp offset, and validate reachability before enabling
 `--execute`. The calibration's recorded MJCF checksum matches the
 `/home/liuqian/copy/Apex_Deploy` model; the WBC model currently has a different
 checksum. Confirm which model controls the physical robot and revalidate the
-calibration before real motion. The grasp program repeats unanswered requests;
-the publisher ignores duplicates while inference is active and accepts another
-request after the current inference finishes.
+calibration before real motion. In continuous mode, the publisher ignores
+duplicate timer ticks while inference is active and starts another inference
+window after the current one finishes. Each window publishes at most 10 pose
+frames by default, enough for the grasp program's five stable samples. On a
+target change during inference, that window stops; the next window generates a
+fresh mask. Stopping the publisher releases both models.
 
 | Input | Format |
 | --- | --- |
