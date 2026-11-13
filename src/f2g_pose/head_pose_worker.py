@@ -109,6 +109,22 @@ def select_mask(paths, index):
     return np.asarray(Image.open(paths[chosen - 1])) > 0
 
 
+def prompt_list(args):
+    """把重复参数或逗号/分号分隔的提示词整理成去重列表。"""
+    values = getattr(args, 'prompts', None)
+    if values is None:
+        values = getattr(args, 'prompt', None)
+    if isinstance(values, str):
+        values = [values]
+    prompts = []
+    for value in values or ('water bottle',):
+        for item in value.replace(';', ',').split(','):
+            item = item.strip()
+            if item and item not in prompts:
+                prompts.append(item)
+    return prompts
+
+
 def capture(url, camera_frame, max_age_s):
     rgb, depth, K, _, header = fetch_frame(url, with_metadata=True)
     if header.get('camera_info', {}).get('frame_id') != camera_frame:
@@ -144,51 +160,92 @@ def verify_target(reference, current, mask, reference_depth, depth):
 
 
 def run(args, estimator=None, sam3_client=None, cache=None):
+    """对同一帧中的多个提示词分别估计位姿，并逐个输出结果。"""
     reference, reference_depth, _, _, _ = capture_retry(args)
-    mask = None
-    if cache is not None and cache.get('mask') is not None:
-        try:
-            verify_target(cache['rgb'], reference, cache['mask'],
-                          cache['depth'], reference_depth)
-            mask = cache['mask']
-        except ValueError:
-            cache.clear()
+    prompts = prompt_list(args)
+    if not prompts:
+        raise ValueError('至少需要一个目标提示词。')
+    # 每个提示词独立缓存掩码，兼容旧调用传入的空字典 cache。
+    prompt_caches = {}
+    if cache is not None:
+        for prompt in prompts:
+            prompt_caches[prompt] = cache.setdefault(prompt, {})
+    masks = {}
     with tempfile.TemporaryDirectory() as directory:
-        if mask is None:
-            output = Path(directory) / 'masks'
-            masks = (sam3_client.generate(reference, output, args.prompt)
-                     if sam3_client is not None else
-                     generate_masks(reference, output, args.sam3_python,
-                                    args.prompt, args.sam3_checkpoint, args.confidence))
-            mask = select_mask(masks, args.instance_index)
-        if mask.shape != reference.shape[:2]:
-            raise ValueError('SAM 3 掩码与 RGB 尺寸不一致。')
-        if cache is not None:
-            cache.update(rgb=reference, depth=reference_depth, mask=mask)
+        for index, prompt in enumerate(prompts):
+            object_cache = prompt_caches.get(prompt)
+            try:
+                mask = None
+                if object_cache is not None and object_cache.get('mask') is not None:
+                    try:
+                        verify_target(object_cache['rgb'], reference, object_cache['mask'],
+                                      object_cache['depth'], reference_depth)
+                        mask = object_cache['mask']
+                    except ValueError:
+                        object_cache.clear()
+                if mask is None:
+                    output = Path(directory) / f'masks_{index + 1}'
+                    paths = (sam3_client.generate(reference, output, prompt)
+                             if sam3_client is not None else
+                             generate_masks(reference, output, args.sam3_python,
+                                            prompt, args.sam3_checkpoint, args.confidence))
+                    mask = select_mask(paths, args.instance_index)
+                if mask.shape != reference.shape[:2]:
+                    raise ValueError(f'SAM 3 掩码与 RGB 尺寸不一致：{prompt}')
+                masks[prompt] = mask
+                if object_cache is not None:
+                    object_cache.update(rgb=reference, depth=reference_depth, mask=mask)
+            except (ValueError, RuntimeError, OSError) as exc:
+                if object_cache is not None:
+                    object_cache.clear()
+                # 某一个类别未检测到时不影响其他类别继续输出。
+                print(json.dumps({'object_name': prompt, 'error': str(exc)},
+                                 ensure_ascii=False), flush=True)
+        if not masks:
+            return 1
         if estimator is None:
             estimator = PoseEstimator(args.checkpoint, radio_repository=args.radio_repository,
                                       radio_checkpoint=args.radio_checkpoint, device=args.device)
         started = time.monotonic()
-        published = 0
+        published_frames = 0
         last_rgb_stamp = None
-        while time.monotonic() - started < args.duration and published < args.max_frames:
+        while (time.monotonic() - started < args.duration and
+               published_frames < args.max_frames):
             try:
                 rgb, depth, K, stamp, rgb_stamp = capture_retry(args)
                 if rgb_stamp == last_rgb_stamp:
                     time.sleep(args.interval)
                     continue
-                verify_target(reference, rgb, mask, reference_depth, depth)
-                result = estimator.predict(rgb, depth, K, mask, .001, return_shape=False)
                 age = time.time() - stamp
                 if not -.05 <= age <= args.max_pose_age:
                     raise ValueError(f'推理完成时图像已过期：{age:.3f} s。')
-                pose = {'stamp': stamp, 'source_rgb_stamp': rgb_stamp,
-                        'frame_id': args.frame_id,
-                        'position_m': np.asarray(result['translation_m']).tolist(),
-                        'quaternion_xyzw': Rotation.from_matrix(result['rotation']).as_quat().tolist()}
-                print(json.dumps({'pose': pose}, allow_nan=False), flush=True)
+                records = []
+                failed_prompts = []
+                for prompt in list(masks):
+                    try:
+                        verify_target(reference, rgb, masks[prompt], reference_depth, depth)
+                        result = estimator.predict(rgb, depth, K, masks[prompt], .001,
+                                                   return_shape=False)
+                        pose = {'stamp': stamp, 'source_rgb_stamp': rgb_stamp,
+                                'frame_id': args.frame_id,
+                                'position_m': np.asarray(result['translation_m']).tolist(),
+                                'quaternion_xyzw': Rotation.from_matrix(result['rotation']).as_quat().tolist()}
+                        records.append({'object_name': prompt, 'pose': pose})
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        failed_prompts.append(prompt)
+                        if cache is not None:
+                            cache.pop(prompt, None)
+                        print(json.dumps({'object_name': prompt,
+                                          'error': str(exc)}, ensure_ascii=False),
+                              flush=True)
+                for prompt in failed_prompts:
+                    masks.pop(prompt, None)
+                if not records:
+                    return 1
+                for record in records:
+                    print(json.dumps(record, allow_nan=False), flush=True)
                 last_rgb_stamp = rgb_stamp
-                published += 1
+                published_frames += 1
             except ValueError as exc:
                 # 场景变化后绝不沿用旧掩码；上游抓取程序将等待新观测并超时。
                 if cache is not None:
@@ -227,7 +284,8 @@ def main(argv=None):
     parser.add_argument('--radio-checkpoint', required=True)
     parser.add_argument('--sam3-python', required=True)
     parser.add_argument('--sam3-checkpoint', required=True)
-    parser.add_argument('--prompt', default='water bottle')
+    parser.add_argument('--prompt', action='append', default=None,
+                        help='目标提示词；可重复传入，也可用逗号或分号分隔多个物体')
     parser.add_argument('--confidence', type=float, default=.5)
     parser.add_argument('--instance-index', type=int)
     parser.add_argument('--camera-frame', default='camera_color_optical_frame')
@@ -240,7 +298,8 @@ def main(argv=None):
     parser.add_argument('--interval', type=float, default=.15)
     parser.add_argument('--serve', action='store_true', help='Keep F2G-Pose and SAM 3 loaded between requests')
     args = parser.parse_args(argv)
-    if (not args.prompt.strip() or not 0 <= args.confidence <= 1 or
+    args.prompts = prompt_list(args)
+    if (not args.prompts or not 0 <= args.confidence <= 1 or
             args.instance_index is not None and args.instance_index < 1 or
             args.max_frames < 1 or not all(np.isfinite(v) and v > 0 for v in
                                          (args.max_frame_age, args.max_pose_age,

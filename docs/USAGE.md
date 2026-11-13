@@ -92,6 +92,26 @@ through the capture; if the target appearance or depth changes substantially,
 the bridge stops rather than reusing the old mask. Multiple detections require
 an explicit `--instance-index` (left to right, starting from 1).
 
+To estimate several object types in each RGB-D frame, repeat `--prompt` or separate
+the prompts with commas/semicolons. The first prompt remains the active target and
+continues to be published as `PoseStamped` on `/object_pose`; choose another active
+target with `--active-object`. All detected objects are also published one at a time
+as JSON `std_msgs/String` messages on `/object_poses`:
+
+```bash
+/usr/bin/python3 scripts/publish_head_pose.py \
+  --prompt 'water bottle' --prompt 'cup' \
+  --active-object 'water bottle'
+ros2 topic echo /object_poses
+```
+
+Each JSON message has `object_name` and `pose`; `pose.position_m` is the translation
+in `luna_head_calibrated_optical` and `pose.quaternion_xyzw` is the orientation.
+`--instance-index` applies to each prompt. If one prompt matches multiple instances,
+run a separate publisher with the desired instance index.
+If one prompt has no detection, the bridge reports an error for that prompt but keeps
+publishing successful prompts from the same frame.
+
 On the local machine, source the robot's ROS environment and start the head
 calibration TF broadcaster with `calibration_data/head_extrinsic.yaml`. Ensure
 `/tj/joint_states` is live and `base_link -> luna_head_calibrated_optical` is

@@ -22,6 +22,11 @@ def test_target_selection_requires_explicit_index_for_multiple_bottles(tmp_path)
     assert worker.select_mask(paths, 2).all()
 
 
+def test_prompt_list_accepts_repeated_and_comma_separated_values():
+    args = SimpleNamespace(prompt=['water bottle,cup', 'cup;book'])
+    assert worker.prompt_list(args) == ['water bottle', 'cup', 'book']
+
+
 def test_mask_reuse_rejects_target_motion():
     ref = np.full((8, 12, 3), 100, np.uint8)
     depth = np.full((8, 12), 1000, np.uint16)
@@ -73,6 +78,69 @@ def test_run_publishes_fresh_camera_pose_without_motion_commands(monkeypatch, tm
     assert record['pose']['stamp'] == 2.
     assert record['pose']['position_m'] == [.2, .1, .8]
     assert record['pose']['quaternion_xyzw'] == [0., 0., 0., 1.]
+
+
+def test_run_publishes_name_and_pose_for_multiple_prompts(monkeypatch, tmp_path, capsys):
+    rgb = np.full((8, 12, 3), 100, np.uint8)
+    depth = np.full((8, 12), 1000, np.uint16)
+    samples = iter([(rgb, depth, np.eye(3), 1., 10.),
+                    (rgb, depth, np.eye(3), 2., 11.)])
+    monkeypatch.setattr(worker, 'capture_retry', lambda *_: next(samples))
+    monkeypatch.setattr(worker.time, 'time', lambda: 2.1)
+
+    def fake_generate(_image, output, _python, prompt, _checkpoint, _confidence):
+        output.mkdir()
+        mask_path = output / 'mask_01.png'
+        Image.fromarray(np.ones((8, 12), np.uint8) * 255).save(mask_path)
+        return [mask_path]
+
+    monkeypatch.setattr(worker, 'generate_masks', fake_generate)
+    estimate = SimpleNamespace(predict=lambda *a, **k: {
+        'translation_m': np.array([.2, .1, .8]), 'rotation': np.eye(3)})
+    args = SimpleNamespace(camera_url='http://camera/frame', camera_frame='camera_color_optical_frame',
+                           max_frame_age=.15, prompt=['bottle', 'cup'],
+                           sam3_python='python', sam3_checkpoint='checkpoint', confidence=.5,
+                           instance_index=None, checkpoint='f2g', radio_repository='radio',
+                           radio_checkpoint='radio.ckpt', device='cuda:0', duration=10.,
+                           max_frames=1, max_pose_age=.5, interval=.001,
+                           frame_id='luna_head_calibrated_optical')
+    assert worker.run(args, estimate) == 0
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [record['object_name'] for record in records] == ['bottle', 'cup']
+    assert all(record['pose']['position_m'] == [.2, .1, .8] for record in records)
+
+
+def test_missing_one_prompt_does_not_drop_other_object_pose(monkeypatch, tmp_path, capsys):
+    rgb = np.full((8, 12, 3), 100, np.uint8)
+    depth = np.full((8, 12), 1000, np.uint16)
+    samples = iter([(rgb, depth, np.eye(3), 1., 10.),
+                    (rgb, depth, np.eye(3), 2., 11.)])
+    monkeypatch.setattr(worker, 'capture_retry', lambda *_: next(samples))
+    monkeypatch.setattr(worker.time, 'time', lambda: 2.1)
+
+    def fake_generate(_image, output, _python, prompt, _checkpoint, _confidence):
+        if prompt == 'cup':
+            raise ValueError('SAM 3 未找到目标物体。')
+        output.mkdir()
+        mask_path = output / 'mask_01.png'
+        Image.fromarray(np.ones((8, 12), np.uint8) * 255).save(mask_path)
+        return [mask_path]
+
+    monkeypatch.setattr(worker, 'generate_masks', fake_generate)
+    estimate = SimpleNamespace(predict=lambda *a, **k: {
+        'translation_m': np.array([.2, .1, .8]), 'rotation': np.eye(3)})
+    args = SimpleNamespace(camera_url='http://camera/frame', camera_frame='camera_color_optical_frame',
+                           max_frame_age=.15, prompt=['water bottle', 'cup'],
+                           sam3_python='python', sam3_checkpoint='checkpoint', confidence=.5,
+                           instance_index=None, checkpoint='f2g', radio_repository='radio',
+                           radio_checkpoint='radio.ckpt', device='cuda:0', duration=10.,
+                           max_frames=1, max_pose_age=.5, interval=.001,
+                           frame_id='luna_head_calibrated_optical')
+    assert worker.run(args, estimate) == 0
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert records[0] == {'object_name': 'cup', 'error': 'SAM 3 未找到目标物体。'}
+    assert records[1]['object_name'] == 'water bottle'
+    assert records[1]['pose']['position_m'] == [.2, .1, .8]
 
 
 def test_repeated_requests_reuse_mask_and_resegment_after_motion(monkeypatch, tmp_path, capsys):

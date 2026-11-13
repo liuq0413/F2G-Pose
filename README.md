@@ -186,6 +186,22 @@ ros2 topic echo /object_pose
 ros2 topic echo /object_pose_changed
 ```
 
+也可以一次识别多个物体类别。重复使用 `--prompt`，或在一个提示词中用逗号分隔；
+第一个提示词继续作为抓取程序使用的活动目标发布到 `/object_pose`，所有目标的名称和位姿
+会以 JSON `std_msgs/String` 逐条发布到 `/object_poses`：
+
+```bash
+/usr/bin/python3 scripts/publish_head_pose.py \
+  --prompt 'water bottle' --prompt 'cup' \
+  --active-object 'water bottle'
+ros2 topic echo /object_poses
+```
+
+消息中的 `object_name` 是提示词名称，`pose.position_m` 和
+`pose.quaternion_xyzw` 是对应的头部相机坐标系位姿。`--active-object` 用于选择继续
+发送到 `/object_pose` 的目标，默认是第一个提示词。
+如果某个提示词没有检测到目标，只报告该提示词的错误，其他已检测到的物体仍会继续发送。
+
 使用 `--instance-index 2`、`3` 等参数可以选择其他 SAM 3 检测结果。若要恢复旧的
 按请求推理模式，增加 `--request-driven`；此时每收到一条 `/f2g_pose/request`
 消息才启动一轮推理。第一帧有效位姿只建立位置变化基准，不会触发变化通知。
